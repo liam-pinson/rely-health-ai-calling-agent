@@ -91,24 +91,36 @@ instead.)
 
 Retell delivers call-status webhooks (`call_started`, `call_ended`, `call_analyzed`) to
 a URL you configure in the Retell dashboard. Since this is local dev, that URL needs to
-tunnel to your machine:
+tunnel to your machine. A helper script starts the tunnel and prints the URL for you:
 
 ```bash
-cloudflared tunnel --url http://localhost:8000
+# macOS / Linux / git-bash
+scripts/start_tunnel.sh
+```
+```powershell
+# Windows (PowerShell)
+scripts/start_tunnel.ps1
 ```
 
-This prints a random `https://<something>.trycloudflare.com` URL. Take that URL, append
-`/events`, and paste it into your Retell dashboard's webhook configuration (agent-level
-or account-level webhook URL field).
+Run it, then **paste the URL it prints into your Retell dashboard's webhook
+configuration** (agent-level or account-level webhook URL field) — that part is still a
+manual step you have to do yourself in your browser; a script can't log into your Retell
+account for you. The script keeps running in the foreground to keep the tunnel alive;
+press Ctrl+C to stop it when you're done.
 
-**Important:** this is Cloudflare's free *quick tunnel*, which requires zero setup (no
+**Important:** this uses Cloudflare's free *quick tunnel*, which requires zero setup (no
 domain, no Cloudflare account) but issues a brand-new random URL every single time it
 restarts — there is no persistent/reserved subdomain. A persistent named tunnel would
 require owning a domain and tying it to a Cloudflare account, which was judged
 unnecessary setup overhead for a take-home project's local dev loop. **Practical
-consequence: every time you restart `cloudflared`, you must go back into the Retell
-dashboard and re-paste the new `<url>/events` value**, or webhooks will silently stop
-arriving (they'll just fail to deliver against the dead old URL).
+consequence: every time you restart the tunnel, you must go back into the Retell
+dashboard and re-paste the new `<url>/events` value** — the script prints a reminder of
+this every time — or webhooks will silently stop arriving (they'll just fail to deliver
+against the dead old URL).
+
+Both scripts require `cloudflared` to already be installed and on `PATH` (see
+Prerequisites above); if it isn't found, they'll tell you so instead of failing
+silently.
 
 ### 5. Open the app
 
@@ -322,6 +334,15 @@ showing raw enum strings. Verified live against a real call
 `disconnection_reason` was `agent_hangup` (→ `closed`) but `call_analysis.in_voicemail`
 was `true`, confirming the "closed · voicemail" label now surfaces correctly where it
 previously would have just read "closed" with no indication anything was off.
+
+**Note on voicemail-label precedence:** `outcome_reason` preserves whichever
+voicemail confirmation arrives first (real-time `voicemail_reached` or
+retrospective `call_analysis.in_voicemail` via `call_analyzed`), regardless
+of arrival order, to prevent either from clobbering the other with a less
+informative value. In the rare case where the retrospective signal arrives
+first, a later real-time signal won't upgrade the label to the more
+specific one — both values correctly indicate voicemail either way, so
+this is a scoped-out cosmetic refinement, not a correctness gap.
 
 ### Unexpected Retell-agent SMS behavior
 

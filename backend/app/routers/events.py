@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +15,25 @@ from app.state_machine import is_legal_transition
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# App-level label for a voicemail outcome confirmed only retrospectively via
+# call_analyzed's call_analysis.in_voicemail -- as opposed to a provider's
+# own real-time signal (e.g. Retell's disconnection_reason:
+# "voicemail_reached"), which provider.is_voicemail_outcome() recognizes.
+LATE_VOICEMAIL_OUTCOME_REASON = "voicemail (detected late)"
+
+
+def _is_confirmed_voicemail_outcome(outcome_reason: Optional[str], provider: CallProvider) -> bool:
+    """True if outcome_reason already represents a confirmed voicemail
+    outcome, whether via the provider's own real-time vocabulary or this
+    app's own late-detection upgrade. Retell doesn't guarantee call_ended
+    arrives before call_analyzed (confirmed live: they can land ~75-90ms
+    apart in either order) -- this lets whichever event processes second
+    avoid clobbering a voicemail confirmation the other one already applied.
+    """
+    return outcome_reason == LATE_VOICEMAIL_OUTCOME_REASON or provider.is_voicemail_outcome(
+        outcome_reason
+    )
 
 
 @router.post("/events", status_code=200)
@@ -65,10 +84,10 @@ async def receive_webhook(
             .filter(CallLog.provider_call_id == normalized.provider_call_id)
             .one_or_none()
         )
-        if voicemail_call_log is not None and not provider.is_voicemail_outcome(
-            voicemail_call_log.outcome_reason
+        if voicemail_call_log is not None and not _is_confirmed_voicemail_outcome(
+            voicemail_call_log.outcome_reason, provider
         ):
-            voicemail_call_log.outcome_reason = "voicemail (detected late)"
+            voicemail_call_log.outcome_reason = LATE_VOICEMAIL_OUTCOME_REASON
             db.commit()
 
     if normalized.mapped_status is None:
@@ -106,7 +125,13 @@ async def receive_webhook(
         return {"status": "recorded"}
 
     call_log.status = normalized.mapped_status
-    if normalized.outcome_reason is not None:
+    if normalized.outcome_reason is not None and not _is_confirmed_voicemail_outcome(
+        call_log.outcome_reason, provider
+    ):
+        # If call_analyzed already arrived first and upgraded outcome_reason
+        # to a confirmed voicemail state, don't let this event's raw
+        # disconnection_reason clobber it with a less specific value -- see
+        # _is_confirmed_voicemail_outcome's docstring.
         call_log.outcome_reason = normalized.outcome_reason
     if normalized.mapped_status in ("closed", "no_response"):
         call_log.ended_at = normalized.event_timestamp

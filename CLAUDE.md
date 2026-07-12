@@ -105,6 +105,27 @@ separate `call_analyzed` event. So `voicemail_reached` catches real-time-detecte
 voicemail; voicemail reached via the agent talking through it and hanging up normally
 still maps to `closed`, and that's accepted as correct given the named non-goal above.
 
+**Update — `outcome_reason` implemented:** `CallLog` now has a nullable `outcome_reason`
+column (migration `0002`), populated at `call_ended` with the raw `disconnection_reason`
+and upgraded by `call_analyzed` to `"voicemail (detected late)"` when
+`call_analysis.in_voicemail` is `true` and the row doesn't already reflect a confirmed
+voicemail outcome. This *does* correlate `call_analysis.in_voicemail` back onto
+`CallLog` — narrower than the "NOT correlated back" note above, which still holds for
+`status` (never derived from `call_analysis`) but no longer for this annotation field.
+Full writeup in README's "Design Notes & Known Tradeoffs."
+
+**Ordering fix (real bug, found and fixed):** Retell does not guarantee `call_ended`
+arrives before `call_analyzed` — confirmed live via a real call
+(`call_7300eee9593005ab9d406535384`) where they landed ~75-90ms apart with
+`call_analyzed` arriving *first*. The original `call_ended` handler unconditionally
+overwrote `outcome_reason` with the raw `disconnection_reason`, silently clobbering a
+voicemail confirmation `call_analyzed` had just set moments earlier. Fixed via a shared
+`_is_confirmed_voicemail_outcome()` guard in `events.py` that both the `call_ended` and
+`call_analyzed` handlers check before writing `outcome_reason`, so whichever of the two
+arrives second no longer overwrites a voicemail confirmation the other already applied —
+`status` derivation and `ALLOWED_TRANSITIONS` were untouched. Covered by two new
+regression tests exercising both arrival orders (see Dev tooling below).
+
 **Confirmed gotcha (Retell docs, verified in spike):** if a call fails to connect (dial
 failure), `call_started` is never sent — no webhook at all in that path.
 `connection_failed` can only be detected via (a) the sync API response, or (b) the
@@ -242,6 +263,10 @@ services:
   only, not production tooling — never wired into app startup, and deliberately kept
   separate from any real patient data inserted for live end-to-end testing.
 - **`app/reconcile.py`** — see "Reconciliation job" under Sequencing decisions above.
+- **`backend/tests/`** — pytest suite, run via `cd backend && python -m pytest`. 44
+  tests, run against a real (dedicated, isolated) test Postgres database rather than a
+  mock/SQLite substitute — see README setup steps. Includes regression coverage for the
+  `call_ended`/`call_analyzed` ordering fix above, exercising both arrival orders.
 
 ---
 

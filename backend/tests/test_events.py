@@ -169,6 +169,41 @@ def test_call_analyzed_upgrades_outcome_reason_to_late_detected_voicemail(
     assert call.outcome_reason == "voicemail (detected late)"
 
 
+def test_call_ended_does_not_clobber_a_call_analyzed_that_arrived_first(
+    client, patient, make_call_log, db_session
+):
+    # Regression test for a real bug: Retell doesn't guarantee call_ended
+    # arrives before call_analyzed -- confirmed live (call_id=
+    # call_7300eee9593005ab9d406535384) landing ~75-90ms apart in either
+    # order. When call_analyzed (in_voicemail: true) arrives FIRST and
+    # upgrades outcome_reason, a later call_ended must not clobber it back
+    # to the raw disconnection_reason -- the opposite ordering from the
+    # test above, which is the case that previously worked.
+    call = make_call_log(patient.id, status="ongoing", provider_call_id="pcid-order-flip")
+
+    analyzed_resp = client.post(
+        "/events",
+        json={
+            "event": "call_analyzed",
+            "call": {"call_id": "pcid-order-flip", "call_analysis": {"in_voicemail": True}},
+            "event_timestamp": 1700000015000,
+        },
+    )
+    assert analyzed_resp.status_code == 200
+    db_session.refresh(call)
+    assert call.status == "ongoing"  # call_analyzed never touches status
+    assert call.outcome_reason == "voicemail (detected late)"
+
+    ended_resp = client.post("/events", json=_call_ended_payload("pcid-order-flip", "agent_hangup"))
+    assert ended_resp.status_code == 200
+    db_session.refresh(call)
+    assert call.status == "closed"
+    # The regression check: outcome_reason must stay "voicemail (detected
+    # late)", not get overwritten to "agent_hangup" just because call_ended
+    # happened to process second.
+    assert call.outcome_reason == "voicemail (detected late)"
+
+
 def test_call_analyzed_does_not_downgrade_an_already_voicemail_reached_outcome(
     client, patient, make_call_log, db_session
 ):

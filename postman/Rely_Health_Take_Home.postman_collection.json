@@ -1,0 +1,663 @@
+{
+  "info": {
+    "_postman_id": "b6f2c9d4-6e2e-4b7a-9b3f-2a7c1e9d5f10",
+    "name": "Rely Health Take-Home — AI Outbound Calling System",
+    "description": "Full API surface for the AI outbound calling take-home: an operator console that places real outbound appointment-reminder calls via Retell, tracked through a webhook-driven 5-state machine (see backend `state_machine.py` / project `CLAUDE.md`).\n\nThree folders:\n1. **Patients** — the read-only list the operator picks a call target from.\n2. **Calls** — placing a call and checking its status, including the 404 paths.\n3. **Events (Webhooks)** — the `POST /events` webhook receiver, split into **Legal** and **Illegal** subfolders. This folder exists specifically so the state machine's behavior — both correctly applying real transitions and correctly rejecting impossible/out-of-order ones — can be demonstrated live, on a local Postgres row, **without needing a real Retell phone call or a cloudflared tunnel**. Every Illegal request's description explains exactly how to seed a `call_logs` row into the right starting status first (via a `docker exec` SQL snippet against the local Postgres container), since the illegal scenarios specifically require states that the live app either passes through too quickly to catch (e.g. `connecting`) or that would collide with the webhook dedup constraint if reached via the normal request chain.\n\n**No real patient data, phone numbers, or API keys anywhere in this collection.** All examples use synthetic `+1555…` seeded patient numbers or deliberately fake UUIDs.\n\nSet the collection variable `base_url` to point at your running backend (defaults to `http://localhost:8000`, i.e. the Docker Compose backend service exposed on the host).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string",
+      "description": "Backend base URL. Default matches `docker compose up`'s host port mapping (8000:8000)."
+    },
+    {
+      "key": "synthetic_patient_id",
+      "value": "bc7c4930-4924-4603-ae87-92e8cfc1b7fc",
+      "type": "string",
+      "description": "A synthetic seeded patient id (Maria Gonzalez, +15555550101) from this project's `python -m app.seed_patients` fixture data, captured from a live dev DB. Patient ids are randomly generated (uuid4()) at seed time, so this exact value is specific to the environment it was captured from — if this 404s against your own dev DB, run 'GET /patients' first, copy the id of any patient whose phone_number starts with +1555, and overwrite this variable."
+    },
+    {
+      "key": "example_call_id",
+      "value": "841098b8-36f8-44c9-b9c2-0e9d62ddd663",
+      "type": "string",
+      "description": "A real completed call_id captured from this project's dev DB (resolved to closed, with outcome_reason later upgraded to 'voicemail (detected late)' by a call_analyzed event — see the project README's outcome_reason design note for the full story). Like synthetic_patient_id, this is environment-specific — if it 404s for you, substitute the call_id returned by the 'Place a call' request in the Calls folder, or any call_id produced by the Events folder's Legal scenarios."
+    }
+  ],
+  "item": [
+    {
+      "name": "Patients",
+      "description": "Read-only patient list the operator console renders and picks a call target from. No auth, no pagination (see CLAUDE.md Non-goals) — this is a demo-scoped internal tool, not a public API.",
+      "item": [
+        {
+          "name": "GET /patients — list all patients",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/patients",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "patients"
+              ]
+            },
+            "description": "Returns every Patient row (id, name, date_of_birth, phone_number, appointment_date/time, timezone). This is the source list the frontend's patient table renders, and the easiest way to grab a fresh `synthetic_patient_id` value if the collection variable default has gone stale for your environment (pick any row whose phone_number starts with +1555)."
+          },
+          "response": [
+            {
+              "name": "200 OK — example",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}/patients",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "patients"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "[\n  {\n    \"id\": \"bc7c4930-4924-4603-ae87-92e8cfc1b7fc\",\n    \"first_name\": \"Maria\",\n    \"last_name\": \"Gonzalez\",\n    \"date_of_birth\": \"1985-03-12\",\n    \"phone_number\": \"+15555550101\",\n    \"appointment_date\": \"2026-07-11\",\n    \"appointment_time\": \"09:00:00\",\n    \"timezone\": \"America/New_York\"\n  }\n]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Calls",
+      "description": "Placing a call and polling its status, including both success and 404 paths for each endpoint.",
+      "item": [
+        {
+          "name": "POST /patients/{id}/call — place a call (synthetic → connection_failed)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/patients/{{synthetic_patient_id}}/call",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "patients",
+                "{{synthetic_patient_id}}",
+                "call"
+              ]
+            },
+            "description": "Places a call for a synthetic `+1555…` seeded patient. **This is safe to run repeatedly — it never places a real phone call and never costs money.** `+1555…` isn't a real routable number, so Retell's own request validation rejects it (HTTP 400) before any call is attempted; the app synchronously marks the `CallLog` row `connection_failed` with `outcome_reason: \"invalid_request\"` and returns 201 with that status in the body (this endpoint always returns 201, even on a provider failure — the *body's* `status` field is what tells you what happened; see `CLAUDE.md`'s 'DB write before provider call' sequencing decision for why).\n\nThis demonstrates the `connecting → connection_failed` branch of the state machine live, and is also how you can grab a fresh, real `call_id` to feed into the 'GET /calls/{id}' request below.\n\nIf `synthetic_patient_id` 404s in your environment (ids are randomly generated at seed time), run 'GET /patients' in the folder above first and copy any +1555 patient's id into that collection variable."
+          },
+          "response": [
+            {
+              "name": "201 Created — connection_failed (real captured response)",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}/patients/{{synthetic_patient_id}}/call",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "patients",
+                    "{{synthetic_patient_id}}",
+                    "call"
+                  ]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"call_id\": \"6041129a-3ae6-455c-b551-743ce70bbf26\",\n  \"patient_id\": \"bc7c4930-4924-4603-ae87-92e8cfc1b7fc\",\n  \"provider_call_id\": null,\n  \"status\": \"connection_failed\",\n  \"started_at\": \"2026-07-12T22:02:21.452570Z\",\n  \"ended_at\": null,\n  \"error_reason\": \"Client error '400 Bad Request' for url 'https://api.retellai.com/v2/create-phone-call'\",\n  \"outcome_reason\": \"invalid_request\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "POST /patients/{id}/call — 404 unknown patient",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/patients/00000000-0000-0000-0000-000000000000/call",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "patients",
+                "00000000-0000-0000-0000-000000000000",
+                "call"
+              ]
+            },
+            "description": "Uses an obviously fake, never-real UUID to demonstrate the 404 path — no `CallLog` row is created for a patient that doesn't exist."
+          },
+          "response": [
+            {
+              "name": "404 Not Found — example",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}/patients/00000000-0000-0000-0000-000000000000/call",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "patients",
+                    "00000000-0000-0000-0000-000000000000",
+                    "call"
+                  ]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Patient not found\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /calls/{id} — completed call (success)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/calls/{{example_call_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "calls",
+                "{{example_call_id}}"
+              ]
+            },
+            "description": "Defaults to a real completed call from this project's dev DB (`closed`, with `outcome_reason` upgraded from `agent_hangup` to `voicemail (detected late)` by a later `call_analyzed` event — see the project README's `outcome_reason` design note for the full story). If `example_call_id` doesn't exist in your environment, substitute the `call_id` returned by 'Place a call' above, or any `call_id` from the Events folder's Legal scenarios."
+          },
+          "response": [
+            {
+              "name": "200 OK — example",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}/calls/{{example_call_id}}",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "calls",
+                    "{{example_call_id}}"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"call_id\": \"841098b8-36f8-44c9-b9c2-0e9d62ddd663\",\n  \"patient_id\": \"5b91b126-f25f-4700-a0a2-eb0eaed0d0e2\",\n  \"provider_call_id\": \"call_8d5921decbb01d6490cded971d6\",\n  \"status\": \"closed\",\n  \"started_at\": \"2026-07-12T18:47:31.186532Z\",\n  \"ended_at\": \"2026-07-12T18:48:15.164000Z\",\n  \"error_reason\": null,\n  \"outcome_reason\": \"voicemail (detected late)\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /calls/{id} — 404 unknown call",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/calls/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "calls",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            },
+            "description": "Uses an obviously fake, never-real UUID to demonstrate the 404 path."
+          },
+          "response": [
+            {
+              "name": "404 Not Found — example",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}/calls/00000000-0000-0000-0000-000000000000",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "calls",
+                    "00000000-0000-0000-0000-000000000000"
+                  ]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Call not found\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Events (Webhooks)",
+      "description": "The `POST /events` webhook receiver — the endpoint Retell delivers `call_started` / `call_ended` / `call_analyzed` events to. This folder is designed to demonstrate the state machine **live, end to end, without a real Retell call or a cloudflared tunnel**: every request below targets a `call_logs` row you seed directly in the local Postgres container via a one-line `docker exec ... psql` command (given in each request's description), then fires a real webhook payload at the real endpoint and lets the app's actual logic (dedup, legal-transition check, status/outcome_reason update) run for real. Nothing here is mocked — only the *source* of the row (direct SQL insert instead of a real Retell-placed call) is substituted, exactly the same pattern this project's own pytest fixtures (`make_call_log`) use.\n\nGeneric cleanup, safe to run any time: `docker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"DELETE FROM call_logs WHERE provider_call_id LIKE 'demo-%'; DELETE FROM webhook_events WHERE provider_call_id LIKE 'demo-%';\"`\n\nSplit into ✅ Legal (transitions the state machine allows) and ❌ Illegal (transitions it correctly rejects) — see each subfolder's own description.",
+      "item": [
+        {
+          "name": "✅ Legal scenarios",
+          "description": "Five real payload shapes this project has actually observed from Retell (trimmed to only the fields the app reads — real Retell payloads carry many more fields, e.g. agent_id, transcript, recording_url, none of which the app currently uses). Each demonstrates a transition the state machine allows; expect `{\"status\": \"applied\"}` for anything that changes `CallLog.status`, or `{\"status\": \"recorded\"}` for `call_analyzed`, which is informational-only by design and never changes status (see CLAUDE.md's event → state mapping table).\n\n'call_started' and 'call_ended (user_hangup)' are designed to run in sequence against the **same** seeded row (`demo-user-hangup`), walking it through its full real lifecycle: dialing → ongoing → closed. The other three scenarios each use their own dedicated, independently-seeded row.",
+          "item": [
+            {
+              "name": "call_started (dialing → ongoing)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_started\",\n  \"call\": {\n    \"call_id\": \"demo-user-hangup\",\n    \"call_status\": \"ongoing\"\n  },\n  \"event_timestamp\": 1700000000000\n}"
+                },
+                "description": "**Prerequisite (run once before this request):**\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-user-hangup', 'dialing', now());\"\n```\nSeeds a fresh row in `dialing` (the state a real call reaches right after Retell's sync API accepts it, before any webhook arrives). Firing this `call_started` webhook against it is the real payload shape Retell sends when a call actually connects — `call.call_status: \"ongoing\"` in the body confirms it. Expected: `{\"status\": \"applied\"}`, row moves to `ongoing`.\n\nRun **'call_ended (user_hangup)'** below next, against this same row, to see it walk all the way to `closed`."
+              },
+              "response": [
+                {
+                  "name": "200 OK — applied",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"applied\"\n}"
+                }
+              ]
+            },
+            {
+              "name": "call_ended — user_hangup (ongoing → closed)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_ended\",\n  \"call\": {\n    \"call_id\": \"demo-user-hangup\",\n    \"disconnection_reason\": \"user_hangup\"\n  },\n  \"event_timestamp\": 1700000010000\n}"
+                },
+                "description": "Run **after** 'call_started' above, against the same `demo-user-hangup` row (must already be `ongoing`, which only `call_started` can produce). `disconnection_reason: \"user_hangup\"` is a normal hangup, which maps to `closed` (not `no_response`) per CLAUDE.md's event → state mapping table. Expected: `{\"status\": \"applied\"}`, row moves to `closed`, `outcome_reason` set to `\"user_hangup\"`, `ended_at` populated from `event_timestamp`.\n\nVerify with 'GET /calls/{id}' (Calls folder) using the `call_id` from the SQL insert, or query directly: `docker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"SELECT status, outcome_reason FROM call_logs WHERE provider_call_id = 'demo-user-hangup';\"`"
+              },
+              "response": [
+                {
+                  "name": "200 OK — applied",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"applied\"\n}"
+                }
+              ]
+            },
+            {
+              "name": "call_ended — dial_no_answer (dialing → no_response)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_ended\",\n  \"call\": {\n    \"call_id\": \"demo-no-answer\",\n    \"disconnection_reason\": \"dial_no_answer\"\n  },\n  \"event_timestamp\": 1700000010000\n}"
+                },
+                "description": "**Prerequisite:**\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-no-answer', 'dialing', now());\"\n```\nOwn dedicated row (independent of the user_hangup pair above). `dial_no_answer` is one of the two `disconnection_reason` values mapped to `no_response` (nobody picked up — direct `dialing → no_response` is a legal single hop, unlike `closed`, which requires passing through `ongoing`). Expected: `{\"status\": \"applied\"}`, row moves to `no_response`, `outcome_reason` set to `\"dial_no_answer\"`."
+              },
+              "response": [
+                {
+                  "name": "200 OK — applied",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"applied\"\n}"
+                }
+              ]
+            },
+            {
+              "name": "call_ended — voicemail_reached (dialing → no_response)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_ended\",\n  \"call\": {\n    \"call_id\": \"demo-voicemail\",\n    \"disconnection_reason\": \"voicemail_reached\"\n  },\n  \"event_timestamp\": 1700000010000\n}"
+                },
+                "description": "**Prerequisite:**\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-voicemail', 'dialing', now());\"\n```\nOwn dedicated row. `voicemail_reached` is Retell's *real-time* voicemail-detection signal on `call_ended` — the other reason mapped to `no_response` alongside `dial_no_answer`. This is distinct from `call_analysis.in_voicemail`, the *retrospective* signal that only arrives later on `call_analyzed` (see the next scenario, and the project README's voicemail-mapping note, for how these two can genuinely diverge). Expected: `{\"status\": \"applied\"}`, row moves to `no_response`, `outcome_reason` set to `\"voicemail_reached\"`."
+              },
+              "response": [
+                {
+                  "name": "200 OK — applied",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"applied\"\n}"
+                }
+              ]
+            },
+            {
+              "name": "call_analyzed (informational only — outcome_reason upgrade)",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_analyzed\",\n  \"call\": {\n    \"call_id\": \"demo-analyzed\",\n    \"call_analysis\": {\n      \"in_voicemail\": true\n    }\n  },\n  \"event_timestamp\": 1700000020000\n}"
+                },
+                "description": "**Prerequisite:**\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at, ended_at, outcome_reason) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-analyzed', 'closed', now(), now(), 'user_hangup');\"\n```\nSeeds a row that's *already* `closed` (as if a real `call_ended` already resolved it) with `outcome_reason: \"user_hangup\"`, simulating a call that looked like a normal hangup in real time. `call_analyzed` never changes `status` — it's informational-only by design (see CLAUDE.md). But if `call_analysis.in_voicemail` is `true` and the existing `outcome_reason` doesn't already say `voicemail_reached`, the app upgrades `outcome_reason` to `\"voicemail (detected late)\"` — exactly the real divergence this project discovered live (a call that looked like `closed`/hangup in real time, later confirmed via transcript analysis to actually have been voicemail; see 'GET /calls/{id} — completed call' above and the README's outcome_reason note). Expected: `{\"status\": \"recorded\"}` (not `\"applied\"` — status is untouched), but querying the row afterward shows `outcome_reason` changed."
+              },
+              "response": [
+                {
+                  "name": "200 OK — recorded",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"recorded\"\n}"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "❌ Illegal scenarios",
+          "description": "Two payloads the state machine correctly rejects — recorded to `webhook_events` for forensic auditability (per CLAUDE.md: 'illegal/duplicate transitions are still recorded... but not applied to CallLog'), but never applied to the `CallLog` row. Both are verified end to end against the real running app before being included here.\n\nExpected response for both: `{\"status\": \"recorded\"}`, with the row's `status` unchanged afterward. Each request's description gives the exact SQL to seed a fresh row in the right starting state — see each one for why the *specific* seeding approach used is necessary (it's not always as simple as reusing a row from the Legal folder).",
+          "item": [
+            {
+              "name": "❌ Illegal: call_ended while connecting",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_ended\",\n  \"call\": {\n    \"call_id\": \"demo-illegal-connecting\",\n    \"disconnection_reason\": \"user_hangup\"\n  },\n  \"event_timestamp\": 1700000010000\n}"
+                },
+                "description": "**Why it's illegal:** per `state_machine.py`'s `ALLOWED_TRANSITIONS`, `connecting`'s only legal next states are `dialing` and `connection_failed` — there is no direct path from `connecting` to `closed` (or `no_response`), because a call must pass through `dialing` (confirmed by Retell's sync API) before any webhook can possibly apply. This event skips straight past `ongoing` entirely.\n\n**Getting a fresh row into `connecting` first:** this is the one scenario where you can't get there via the live app — `POST /patients/{id}/call` writes `connecting` and then resolves the provider call *synchronously within the same request*, so by the time you can observe it, it's already moved past `connecting`. Seed it directly instead:\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-illegal-connecting', 'connecting', now());\"\n```\n**Expected:** `{\"status\": \"recorded\"}`. Verify the row is still `connecting` (untouched): `docker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"SELECT status FROM call_logs WHERE provider_call_id = 'demo-illegal-connecting';\"`"
+              },
+              "response": [
+                {
+                  "name": "200 OK — recorded (not applied)",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"recorded\"\n}"
+                }
+              ]
+            },
+            {
+              "name": "❌ Illegal: call_started after closed",
+              "request": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "url": {
+                  "raw": "{{base_url}}/events",
+                  "host": [
+                    "{{base_url}}"
+                  ],
+                  "path": [
+                    "events"
+                  ]
+                },
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"event\": \"call_started\",\n  \"call\": {\n    \"call_id\": \"demo-illegal-closed\",\n    \"call_status\": \"ongoing\"\n  },\n  \"event_timestamp\": 1700000020000\n}"
+                },
+                "description": "**Why it's illegal:** `closed` has no legal next states at all (it's terminal) — this simulates a late/out-of-order `call_started` webhook arriving after the call has already fully resolved, which must not move status backward or sideways.\n\n**Getting a fresh row into `closed` first — read this carefully:** it's tempting to reuse the `demo-user-hangup` row from the Legal folder (already `closed` after running 'call_started' + 'call_ended (user_hangup)' there) and simply fire `call_started` at it again. **Don't** — that row already received one real `call_started` event, so a second one hits the `(event_type, provider_call_id)` webhook dedup constraint *first* and returns `{\"status\": \"duplicate_ignored\"}` instead of demonstrating the illegal-transition rejection path (confirmed by actually running it this way). To see the real `{\"status\": \"recorded\"}` illegal-transition response, seed a **fresh** row directly at `closed`, with a `provider_call_id` that has never seen a `call_started` event:\n```\ndocker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"INSERT INTO call_logs (call_id, patient_id, provider_call_id, status, started_at, ended_at, outcome_reason) VALUES (gen_random_uuid(), (SELECT id FROM patients LIMIT 1), 'demo-illegal-closed', 'closed', now(), now(), 'user_hangup');\"\n```\n**Expected:** `{\"status\": \"recorded\"}`. Verify the row is still `closed` (untouched): `docker exec ai_calling_agent_postgres psql -U postgres -d ai_calling_agent -c \"SELECT status FROM call_logs WHERE provider_call_id = 'demo-illegal-closed';\"`"
+              },
+              "response": [
+                {
+                  "name": "200 OK — recorded (not applied)",
+                  "originalRequest": {
+                    "method": "POST",
+                    "url": {
+                      "raw": "{{base_url}}/events",
+                      "host": [
+                        "{{base_url}}"
+                      ],
+                      "path": [
+                        "events"
+                      ]
+                    }
+                  },
+                  "status": "OK",
+                  "code": 200,
+                  "_postman_previewlanguage": "json",
+                  "header": [
+                    {
+                      "key": "Content-Type",
+                      "value": "application/json"
+                    }
+                  ],
+                  "body": "{\n  \"status\": \"recorded\"\n}"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
