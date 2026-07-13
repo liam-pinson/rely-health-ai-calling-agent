@@ -156,11 +156,11 @@ Everything below is actually built and running today — no speculative pieces. 
 ```mermaid
 flowchart TB
     subgraph Client["Browser"]
-        UI["Next.js UI<br/>(patient list, Call button, status)"]
+        UI["Next.js UI<br/>(patients, Call, status)"]
     end
 
     subgraph Frontend["Frontend Container"]
-        Proxy["Next.js API Routes<br/>(server-side proxy, avoids CORS)"]
+        Proxy["Next.js API Routes<br/>(server-side proxy)"]
     end
 
     subgraph Backend["Backend Container (FastAPI)"]
@@ -169,9 +169,9 @@ flowchart TB
         Events["POST /events (webhook receiver)"]
         CallsGet["GET /calls/{id}"]
         SM["state_machine.py<br/>(ALLOWED_TRANSITIONS)"]
-        Reconcile["reconcile.py<br/>(manual sweep, BFS hop-replay)"]
+        Reconcile["reconcile.py<br/>(sweep + BFS replay)"]
         Provider["CallProvider interface"]
-        Retell["RetellProvider<br/>(place_call, parse_webhook_event,<br/>get_call_status, error categorization)"]
+        Retell["RetellProvider<br/>(calls + webhooks)"]
     end
 
     subgraph DB["Postgres"]
@@ -473,11 +473,11 @@ one possible direction, not a commitment.**
 ```mermaid
 flowchart TB
     subgraph Client["Browser"]
-        UI["Next.js UI<br/>(patient list, Call button, status)"]
+        UI["Next.js UI<br/>(patients, Call, status)"]
     end
 
     subgraph Frontend["Frontend Container"]
-        Proxy["Next.js API Routes<br/>(server-side proxy, avoids CORS)"]
+        Proxy["Next.js API Routes<br/>(server-side proxy)"]
     end
 
     subgraph Backend["Backend Container (FastAPI)"]
@@ -486,9 +486,9 @@ flowchart TB
         Events["POST /events (webhook receiver)"]
         CallsGet["GET /calls/{id}"]
         SM["state_machine.py<br/>(ALLOWED_TRANSITIONS)"]
-        Reconcile["reconcile.py<br/>(manual sweep, BFS hop-replay)"]
+        Reconcile["reconcile.py<br/>(sweep + BFS replay)"]
         Provider["CallProvider interface"]
-        Retell["RetellProvider"]
+        Retell["RetellProvider<br/>(calls + webhooks)"]
     end
 
     subgraph DB["Postgres"]
