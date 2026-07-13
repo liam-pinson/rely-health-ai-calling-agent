@@ -27,7 +27,33 @@ requirements that don't exist yet.
   → edit number → set outbound agent). Retell rejects `create-phone-call` with `"No
   outbound agent id set up for phone number."` if this isn't done first.
 - [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-  (only needed if you want Retell's webhooks to reach your local backend — see step 4).
+  (only needed if you want Retell's webhooks to reach your local backend — see step 5).
+
+  **Windows troubleshooting (skip this if you're on Mac/Linux):** installing via
+  `winget install --id Cloudflare.cloudflared` does not reliably add `cloudflared` to
+  `PATH` on its own — confirmed during a fresh-clone test, where it landed in
+  `C:\Program Files (x86)\cloudflared\` without winget's usual auto-linking kicking in,
+  leaving `cloudflared --version` unresolvable even though the install itself
+  succeeded. If that happens to you:
+  1. Confirm the install actually succeeded: `winget list --id Cloudflare.cloudflared`
+     — should show a version. If not, the install itself failed.
+  2. If `cloudflared --version` still fails after a successful install, find the
+     actual binary location:
+     ```powershell
+     Get-ChildItem -Path "C:\Program Files (x86)" -Recurse -Filter "cloudflared.exe" -ErrorAction SilentlyContinue
+     Get-ChildItem -Path "C:\Program Files" -Recurse -Filter "cloudflared.exe" -ErrorAction SilentlyContinue
+     ```
+  3. Add the folder (not the `.exe`) to `PATH` via System Properties → Environment
+     Variables → Path → New. Paste the exact folder path found in step 2 —
+     double-check for typos before confirming, and make sure every dialog (Edit →
+     Environment Variables → System/User Properties) is closed with OK, not Cancel.
+  4. Fully close every open terminal window (not just a new tab — PATH changes
+     aren't picked up by already-running sessions) and open a completely fresh one.
+  5. Verify:
+     ```powershell
+     $env:Path -split ';' | Select-String "cloudflared"
+     cloudflared --version
+     ```
 
 ### 1. Clone and configure environment variables
 
