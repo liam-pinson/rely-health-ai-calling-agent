@@ -115,10 +115,11 @@ instead.)
 
 ### 4. Add a custom patient with a real phone number (optional)
 
-`seed_patients.py`'s synthetic `+1555...` numbers can't receive an actual call --
-if you want to place a real test call, add one patient with your own real, callable
-number instead:
+The seed script above only creates synthetic `+1555`-prefixed numbers, which can't
+receive an actual phone call. To test an actual end-to-end call, add one custom patient
+with a real number using `add_custom_patient.py`:
 
+**macOS / Linux / git-bash:**
 ```bash
 docker compose exec backend python -m app.add_custom_patient \
   --name "Full Name" \
@@ -128,10 +129,19 @@ docker compose exec backend python -m app.add_custom_patient \
   --timezone "America/Los_Angeles"
 ```
 
-(`America/Los_Angeles` above is just the example used during this project's own
-testing, done from San Francisco -- use whatever timezone is correct for your
-patient.) Same idempotency behavior as the seed script: re-running with a phone
-number that already exists skips it with a warning instead of duplicating.
+**Windows PowerShell:**
+```powershell
+docker compose exec backend python -m app.add_custom_patient --name "Full Name" --phone "+1..." --dob YYYY-MM-DD --appointment "YYYY-MM-DD HH:MM:SS" --timezone "America/Los_Angeles"
+```
+
+> **Note for PowerShell users:** the `\` line-continuation shown above is bash syntax
+> and will error in PowerShell (`Missing expression after unary operator '--'`).
+> Either run the command on a single line as shown, or use PowerShell's backtick
+> (`` ` ``) continuation character instead of `\`.
+
+This script follows the same idempotency pattern as `seed_patients.py` — it will skip
+and warn rather than duplicate if the phone number already exists. It's a manual dev/
+testing convenience, not production tooling, same as the seed script itself.
 
 ### 5. Expose the backend for Retell webhooks (cloudflared)
 
