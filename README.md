@@ -148,7 +148,10 @@ compose up postgres` or the full stack) before running tests.
 
 ---
 
-## Architecture Diagram
+## Current Architecture
+
+Everything below is actually built and running today — no speculative pieces. See
+"Possible Future Architecture" further down for how this could grow.
 
 ```mermaid
 flowchart TB
@@ -192,31 +195,28 @@ flowchart TB
     Patients --> PatientTbl
     CallsGet --> CallLogTbl
 
-    Vapi["VapiProvider<br/>(2nd provider)"]:::ext
-    SMS["SMS / multi-channel<br/>fallback"]:::ext
-    Escalation["Escalation to<br/>human navigator"]:::ext
-    Batch["Batch / bulk<br/>calling orchestrator"]:::ext
-    EHR["EHR sync service"]:::ext
-    Scheduler["Cron / APScheduler<br/>(auto-run reconcile.py)"]:::ext
-    WS["WebSocket push<br/>(replace polling)"]:::ext
-    Auth["Auth layer<br/>(session/token, RBAC)"]:::ext
+    class UI,Proxy frontend
+    class Patients,CallEP,Events,CallsGet route
+    class SM,Reconcile,Provider,Retell logic
+    class PatientTbl,CallLogTbl,WebhookTbl db
+    class RetellAPI,Tunnel external
 
-    Provider -.-> Vapi
-    CallLogTbl -.-> SMS
-    SM -.-> Escalation
-    CallEP -.-> Batch
-    PatientTbl -.-> EHR
-    Reconcile -.-> Scheduler
-    CallsGet -.-> WS
-    Client -.-> Auth
-    Backend -.-> Auth
-
-    classDef ext stroke-dasharray: 5 5,fill:none;
+    classDef frontend fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    classDef route fill:#5CB85C,stroke:#3D8B3D,color:#fff
+    classDef logic fill:#F0C040,stroke:#B8901E,color:#000
+    classDef db fill:#9E9E9E,stroke:#616161,color:#fff
+    classDef external fill:#E8994C,stroke:#B5702A,color:#fff
 ```
 
----
+| Color | Meaning |
+|---|---|
+| Blue | Frontend |
+| Green | Backend route/handler |
+| Yellow | State machine / business logic |
+| Gray | Database table |
+| Orange | External service (Retell, including the dev-only cloudflared tunnel) |
 
-## Architecture & Rationale
+### How the pieces fit together
 
 **Provider abstraction.** All Retell-specific logic (API URLs, request/response shapes,
 `disconnection_reason` interpretation, error categorization) lives behind a
@@ -262,6 +262,328 @@ occurred, unlike a webhook, which only ever witnesses one transition at a time.
 
 ---
 
+## Data Model
+
+Three tables, pulled directly from `backend/app/models.py`.
+
+### `patients`
+
+| Column | Type | Nullable | Purpose |
+|---|---|---|---|
+| `id` | UUID | No (PK) | Primary key, generated client-side via `uuid4()` |
+| `first_name` | String | No | Patient's first name |
+| `last_name` | String | No | Patient's last name |
+| `date_of_birth` | Date | No | Patient's date of birth |
+| `phone_number` | String | No | E.164 number Retell dials |
+| `appointment_date` | Date | No | Date of the upcoming appointment being reminded about |
+| `appointment_time` | Time | No | Time of the upcoming appointment |
+| `timezone` | String | No | IANA timezone string for the appointment (e.g. `America/New_York`) |
+
+`insurance_number`, `medical_record_number`, and `home_address` are deliberately not
+columns here — see "What's Left Undone."
+
+### `call_logs`
+
+| Column | Type | Nullable | Purpose |
+|---|---|---|---|
+| `call_id` | UUID | No (PK) | Our own call identifier, generated at click-time — before Retell ever responds |
+| `patient_id` | UUID | No (FK → `patients.id`) | Which patient this call was placed to |
+| `provider_call_id` | String | Yes (unique) | Retell's `call_id`, filled in once the sync API responds; `null` if the provider call never got that far |
+| `status` | String | No | Current state-machine status (`connecting`/`dialing`/`ongoing`/`closed`/`connection_failed`/`no_response`) |
+| `started_at` | DateTime (tz-aware) | No | When this row was written, before Retell was contacted |
+| `ended_at` | DateTime (tz-aware) | Yes | When the call reached a terminal state, from the webhook/poll's own `event_timestamp` |
+| `error_reason` | String | Yes | Free-text detail when a provider call fails (e.g. the HTTP status line) |
+| `outcome_reason` | String | Yes | Shorthand terminal-state annotation (raw `disconnection_reason`, an upgraded voicemail label, or a `ProviderCallError` category) — stored alongside `status`, never used to derive it |
+
+`provider_call_id` has a DB-level unique constraint (`uq_call_logs_provider_call_id`).
+
+### `webhook_events`
+
+| Column | Type | Nullable | Purpose |
+|---|---|---|---|
+| `event_type` | String | No (composite PK) | Retell's event name (`call_started` / `call_ended` / `call_analyzed`) |
+| `provider_call_id` | String | No (composite PK) | Retell's `call_id` — combined with `event_type` as the dedup key |
+| `raw_payload` | JSONB | No | The full webhook body exactly as received, untouched |
+| `received_at` | DateTime (tz-aware) | No | When this server received the delivery |
+
+---
+
+## API Endpoints
+
+Real example payloads below are pulled from
+`postman/Rely_Health_Take_Home.postman_collection.json`, captured against a live run of
+this system — not invented.
+
+### `GET /patients`
+
+List every patient for the operator to pick a call target from. No auth, no pagination.
+
+**Request:** no body, no params.
+
+**Response — `200`:**
+```json
+[
+  {
+    "id": "bc7c4930-4924-4603-ae87-92e8cfc1b7fc",
+    "first_name": "Maria",
+    "last_name": "Gonzalez",
+    "date_of_birth": "1985-03-12",
+    "phone_number": "+15555550101",
+    "appointment_date": "2026-07-11",
+    "appointment_time": "09:00:00",
+    "timezone": "America/New_York"
+  }
+]
+```
+
+**Status codes:** `200` always (empty array if nothing's been seeded yet).
+
+### `POST /patients/{patient_id}/call`
+
+Places an outbound call for the given patient — writes the `CallLog` row before
+contacting Retell (see "Request Flow" below for why).
+
+**Request:** no body; `patient_id` path param.
+
+**Response — `201`** (always 201, even on a provider failure — the body's `status`
+field is what tells you what happened):
+```json
+{
+  "call_id": "6041129a-3ae6-455c-b551-743ce70bbf26",
+  "patient_id": "bc7c4930-4924-4603-ae87-92e8cfc1b7fc",
+  "provider_call_id": null,
+  "status": "connection_failed",
+  "started_at": "2026-07-12T22:02:21.452570Z",
+  "ended_at": null,
+  "error_reason": "Client error '400 Bad Request' for url 'https://api.retellai.com/v2/create-phone-call'",
+  "outcome_reason": "invalid_request"
+}
+```
+
+**Response — `404`** (unknown `patient_id`):
+```json
+{ "detail": "Patient not found" }
+```
+
+**Status codes:** `201` (row created regardless of provider outcome), `404` (no such
+patient).
+
+### `GET /calls/{call_id}`
+
+Poll a call's current status — this is what the frontend hits every ~2.5s until a
+terminal state.
+
+**Request:** no body; `call_id` path param.
+
+**Response — `200`:**
+```json
+{
+  "call_id": "841098b8-36f8-44c9-b9c2-0e9d62ddd663",
+  "patient_id": "5b91b126-f25f-4700-a0a2-eb0eaed0d0e2",
+  "provider_call_id": "call_8d5921decbb01d6490cded971d6",
+  "status": "closed",
+  "started_at": "2026-07-12T18:47:31.186532Z",
+  "ended_at": "2026-07-12T18:48:15.164000Z",
+  "error_reason": null,
+  "outcome_reason": "voicemail (detected late)"
+}
+```
+
+**Response — `404`:**
+```json
+{ "detail": "Call not found" }
+```
+
+**Status codes:** `200`, `404`.
+
+### `POST /events`
+
+Retell's webhook receiver — `call_started`, `call_ended`, and `call_analyzed` all land
+here. See "Request Flow" below for the full pipeline.
+
+**Request** (example — `call_ended`):
+```json
+{
+  "event": "call_ended",
+  "call": {
+    "call_id": "demo-user-hangup",
+    "disconnection_reason": "user_hangup"
+  },
+  "event_timestamp": 1700000010000
+}
+```
+
+**Response — `200`**, one of three bodies depending on what happened:
+- `{"status": "applied"}` — legal transition, `CallLog` updated
+- `{"status": "recorded"}` — logged to `webhook_events` but not applied (illegal/duplicate
+  transition, or an informational-only event like `call_analyzed`)
+- `{"status": "duplicate_ignored"}` — this exact `(event_type, provider_call_id)` pair
+  was already delivered once
+
+**Status codes:** `200` always. No signature verification is implemented yet (see
+"What's Left Undone"), so the endpoint doesn't reject unauthenticated payloads at the
+HTTP level — it just may not apply them.
+
+---
+
+## Request Flow: What Happens When You Click "Call"
+
+1. Operator clicks "Call" next to a patient row in the Next.js UI (`PatientRow.tsx`).
+2. The browser POSTs to the frontend's own `/api/patients/{id}/call` **Route Handler** —
+   never directly to the backend (this is the CORS workaround, not a security boundary).
+3. That Route Handler proxies server-side to the real backend:
+   `POST {API_BASE_URL}/patients/{id}/call`.
+4. The backend looks up the patient; if not found, `404` and nothing is written.
+5. **The DB write happens first, deliberately, before Retell is ever contacted:** a new
+   `CallLog` row is inserted with `status: "connecting"` and committed. This is the
+   load-bearing sequencing decision in this project — if the write happened *after* the
+   provider call, a successful Retell call paired with a failed DB write would be
+   invisible forever (unrecoverable). Writing first means a failed provider call after a
+   successful write is merely detectable and recoverable instead.
+6. The backend calls `CallProvider.place_call()` → `RetellProvider` → Retell's
+   `POST /v2/create-phone-call`.
+   - **On failure:** `CallLog.status` → `connection_failed`, `error_reason`/
+     `outcome_reason` populated from the categorized `ProviderCallError` — the row is
+     never lost, just marked failed.
+   - **On success:** Retell's sync response includes a real `call_id` immediately, so
+     `CallLog.provider_call_id` is populated right away and `status` → `dialing`.
+7. The `201` response flows back through the frontend proxy to the browser, which starts
+   polling `GET /calls/{call_id}` every ~2.5s.
+8. Retell places the real phone call. As it progresses, Retell delivers webhooks to the
+   tunnel URL configured in the dashboard: `call_started` (`dialing` → `ongoing`), then
+   `call_ended` (`ongoing` → `closed`/`no_response`, depending on `disconnection_reason`),
+   and separately `call_analyzed` (informational, may upgrade `outcome_reason`).
+9. Each webhook delivery is inserted into `webhook_events` first, unconditionally
+   (append-only, keyed on `(event_type, provider_call_id)` for dedup) — before any
+   interpretation happens.
+10. The normalized event is checked against `state_machine.py`'s `ALLOWED_TRANSITIONS`;
+    a legal transition updates `CallLog.status` (and `outcome_reason`/`ended_at` where
+    relevant), an illegal or duplicate one is recorded but not applied.
+11. The frontend's next poll of `GET /calls/{call_id}` picks up the new status; once it's
+    one of the three terminal states (`closed`, `connection_failed`, `no_response`),
+    polling stops and the UI shows the final "status · reason" label.
+
+---
+
+## Possible Future Architecture
+
+**Speculative — none of the purple components below are implemented today. This shows
+one possible direction, not a commitment.**
+
+```mermaid
+flowchart TB
+    subgraph Client["Browser"]
+        UI["Next.js UI<br/>(patient list, Call button, status)"]
+    end
+
+    subgraph Frontend["Frontend Container"]
+        Proxy["Next.js API Routes<br/>(server-side proxy, avoids CORS)"]
+    end
+
+    subgraph Backend["Backend Container (FastAPI)"]
+        Patients["GET /patients"]
+        CallEP["POST /patients/{id}/call"]
+        Events["POST /events (webhook receiver)"]
+        CallsGet["GET /calls/{id}"]
+        SM["state_machine.py<br/>(ALLOWED_TRANSITIONS)"]
+        Reconcile["reconcile.py<br/>(manual sweep, BFS hop-replay)"]
+        Provider["CallProvider interface"]
+        Retell["RetellProvider"]
+    end
+
+    subgraph DB["Postgres"]
+        PatientTbl[("patients")]
+        CallLogTbl[("call_logs")]
+        WebhookTbl[("webhook_events")]
+    end
+
+    subgraph External["Retell (external)"]
+        RetellAPI["Retell API"]
+        Tunnel["cloudflared tunnel<br/>(dev-only)"]
+    end
+
+    UI --> Proxy --> Patients & CallEP & CallsGet
+    CallEP --> SM --> CallLogTbl
+    CallEP --> Provider --> Retell --> RetellAPI
+    RetellAPI -.webhook.-> Tunnel --> Events --> WebhookTbl
+    Events --> SM
+    Reconcile --> Provider
+    Reconcile --> SM
+    Patients --> PatientTbl
+    CallsGet --> CallLogTbl
+
+    Vapi["VapiProvider<br/>(2nd provider)"]
+    SMS["SMS / multi-channel<br/>fallback"]
+    Escalation["Escalation to<br/>human navigator"]
+    Batch["Batch / bulk<br/>calling orchestrator"]
+    EHR["EHR sync service"]
+    Scheduler["Cron / APScheduler<br/>(auto-run reconcile.py)"]
+    WS["WebSocket push<br/>(replace polling)"]
+    Auth["Auth layer<br/>(session/token, RBAC)"]
+
+    Provider -.-> Vapi
+    CallLogTbl -.-> SMS
+    SM -.-> Escalation
+    CallEP -.-> Batch
+    PatientTbl -.-> EHR
+    Reconcile -.-> Scheduler
+    CallsGet -.-> WS
+    Client -.-> Auth
+    Backend -.-> Auth
+
+    class UI,Proxy frontend
+    class Patients,CallEP,Events,CallsGet route
+    class SM,Reconcile,Provider,Retell logic
+    class PatientTbl,CallLogTbl,WebhookTbl db
+    class RetellAPI,Tunnel external
+    class Vapi,SMS,Escalation,Batch,EHR,Scheduler,WS,Auth future
+
+    classDef frontend fill:#4A90D9,stroke:#2C5F8A,color:#fff
+    classDef route fill:#5CB85C,stroke:#3D8B3D,color:#fff
+    classDef logic fill:#F0C040,stroke:#B8901E,color:#000
+    classDef db fill:#9E9E9E,stroke:#616161,color:#fff
+    classDef external fill:#E8994C,stroke:#B5702A,color:#fff
+    classDef future fill:#C9A0DC,stroke:#7B4397,color:#000,stroke-dasharray: 5 5
+```
+
+| Color | Meaning |
+|---|---|
+| Blue | Frontend |
+| Green | Backend route/handler |
+| Yellow | State machine / business logic |
+| Gray | Database table |
+| Orange | External service (Retell) |
+| Purple (dashed border) | Not implemented — hypothetical future component |
+
+- **Second provider (e.g. Vapi):** implement `CallProvider` in a new
+  `app/providers/vapi.py` and register it in `factory.py` — no changes needed to route
+  handlers, `reconcile.py`, or `state_machine.py`; that boundary was built for exactly
+  this.
+- **SMS fallback:** on a `no_response`/`connection_failed` terminal state, trigger an SMS
+  send via a new provider-style abstraction (e.g. `SmsProvider`) — reuses the same
+  "write intent to DB before calling an external API" sequencing already used for calls.
+- **Escalation to a human navigator:** a new terminal/queued state plus a notification
+  hook (Slack/email) fired on `no_response`/`connection_failed` — mostly a
+  `state_machine.py` and routing addition, not a new subsystem.
+- **Batch calling:** a scheduler that iterates upcoming appointments and calls
+  `POST /patients/{id}/call` for each — the existing sequencing/idempotency guarantees
+  already support this; the new work is purely orchestration.
+- **EHR sync:** a periodic or event-driven job to pull `Patient` fields (and reintroduce
+  fields dropped today, like `insurance_number`) from a real EHR — `patients` becomes a
+  projection/cache rather than the source of truth.
+- **Retry/backoff:** wrap `place_call()` failures in a retry policy before falling back
+  to `connection_failed` — contained entirely within `calls.py`'s provider-call boundary,
+  doesn't touch the state machine.
+- **WebSockets/real-time push:** replace or supplement the ~2.5s polling loop with a
+  push channel — additive to the existing polling fallback for resilience, not a
+  replacement.
+- **Auth:** add an API-gateway/auth layer in front of all four routes, plus wire up
+  Retell's `Retell.verify()` on `POST /events` so the webhook receiver stops trusting
+  arbitrary payloads — the single highest-priority item here given the system handles
+  real (if fictional/test) phone numbers.
+
+---
+
 ## Design Notes & Known Tradeoffs
 
 ### Test fixture naming
@@ -275,65 +597,49 @@ transitions, not cleaned up as leftover test cruft.
 
 ### `seed_patients.py`: dev fixture, not production tooling
 
-`seed_patients.py` is a standalone script (`python -m app.seed_patients`), never wired
-into app startup. It exists purely so a fresh clone has plausible demo data to click
-through in the UI — realistic name/timezone/appointment-date variety, `+1555`-prefixed
-fictional-use phone numbers. It's idempotent-safe (skips any row whose phone number
-already exists rather than duplicating it), so it's safe to re-run after a partial seed
-or a restart. It's deliberately kept separate from any real patient data inserted for
-live end-to-end testing against the real Retell API, so demo fixtures and real test
-calls never get tangled together in the same rows.
+Standalone script (`python -m app.seed_patients`), never wired into app startup — exists
+purely so a fresh clone has realistic demo data to click through (varied
+timezones/appointment dates, `+1555`-prefixed fictional numbers). Idempotent-safe (skips
+rows whose `phone_number` already exists) and deliberately kept separate from any real
+patient data used in live Retell testing, so demo fixtures and real test calls never mix.
 
-### cloudflared: two caveats worth knowing before you rely on it
+### cloudflared: two caveats worth knowing
 
-1. **No webhook signature verification.** Retell ships a `Retell.verify()` helper that
-   checks the `X-Retell-Signature` header against your API key to confirm a webhook
-   really came from Retell. This is **not implemented** — `POST /events` currently
-   trusts any payload sent to it. Combined with a public `trycloudflare.com` URL, this
-   means anyone who discovers the tunnel URL while it's live could POST a fabricated
-   webhook. Acceptable for local dev on an ephemeral, hard-to-guess URL; not acceptable
-   as-is for anything beyond that (see "What's Left Undone" below).
-2. **Fresh URL on every restart.** Covered in Setup step 4 above — worth repeating here
-   because it's the single most common "why did my webhooks stop arriving" gotcha
-   during development: restarting `cloudflared` silently orphans the old URL, and Retell
-   will keep trying to deliver to it until you update the dashboard.
+1. **No webhook signature verification.** `POST /events` trusts any payload sent to it —
+   Retell's `Retell.verify()` helper (checks `X-Retell-Signature`) isn't wired up.
+   Combined with a public tunnel URL, anyone who discovers it while live could POST a
+   fabricated webhook. Fine for a local, ephemeral, hard-to-guess URL; not fine beyond
+   that (see "What's Left Undone").
+2. **Fresh URL on every restart.** The single most common "why did my webhooks stop
+   arriving" gotcha during development — restarting `cloudflared` silently orphans the
+   old URL, and Retell keeps retrying against it until you update the dashboard.
 
 ### Voicemail mapping: what's covered, what isn't
 
-Only three `disconnection_reason` values are mapped explicitly: `user_hangup` and
-`agent_hangup` → `closed`; `dial_no_answer` and `voicemail_reached` → `no_response`.
-Every other/unrecognized `disconnection_reason` value defaults to `closed`. This is a
-named non-goal, not an oversight — full enumeration of Retell's `disconnection_reason`
-space was out of scope for this build. Separately, `voicemail_reached` (a *real-time*
-signal on `call_ended`) is distinct from `call_analysis.in_voicemail` (a *retrospective*,
-transcript-derived signal that only arrives later on `call_analyzed`) — confirmed via
-live testing that these two can genuinely diverge: a call where the agent talked through
-voicemail and hung up itself surfaces `disconnection_reason: "agent_hangup"` (mapped to
-`closed`, not `no_response`) at `call_ended`, with `call_analysis.in_voicemail: true`
-only showing up afterward on the separate `call_analyzed` event. See `outcome_reason`
-below for how that divergence is now surfaced to the operator instead of silently lost.
+Only three `disconnection_reason` values are mapped explicitly — `user_hangup`/
+`agent_hangup` → `closed`, `dial_no_answer`/`voicemail_reached` → `no_response` —
+everything else defaults to `closed` (named non-goal, not an oversight). `voicemail_reached`
+(real-time, on `call_ended`) is a different signal from `call_analysis.in_voicemail`
+(retrospective, on `call_analyzed`), and they can genuinely diverge: a call where the
+agent talked through voicemail and hung up itself surfaces `disconnection_reason:
+"agent_hangup"` at `call_ended` (→ `closed`), with `call_analysis.in_voicemail: true`
+only showing up later on the separate `call_analyzed` event. See `outcome_reason` below
+for how that divergence is now surfaced instead of silently lost.
 
 ### `outcome_reason`: a shorthand annotation next to every terminal status
 
-`CallLog` has a nullable `outcome_reason` column, populated alongside `status` — never
-used to *derive* it, so all existing state-machine/mapping logic is untouched. At
-`call_ended`, it's set to the raw `disconnection_reason` value from the webhook payload
-(`user_hangup`, `agent_hangup`, `dial_no_answer`, `voicemail_reached`). At `call_analyzed`
-(still a no-op for `status`), if `call_analysis.in_voicemail` is `true` and
-`outcome_reason` doesn't already say `voicemail_reached`, it's upgraded to `"voicemail
-(detected late)"` — so a call that resolved to `closed` via `agent_hangup` but was later
-confirmed by transcript analysis to actually be voicemail is visibly distinguishable in
-the UI from a `closed` that was a genuine hangup, instead of that distinction being
-buried in `call_analyzed`'s informational-only payload. `connection_failed` rows also get
-an `outcome_reason`, populated from `ProviderCallError.category` (`invalid_request` /
-`provider_config_error` / `unknown`) at the point the provider call fails. The frontend
-maps these raw values to short human-readable labels (e.g. "closed · voicemail",
-"no response · no answer", "connection failed · provider config error") rather than
-showing raw enum strings. Verified live against a real call
-(`call_id=841098b8-36f8-44c9-b9c2-0e9d62ddd663`) that hit exactly this divergence: its
-`disconnection_reason` was `agent_hangup` (→ `closed`) but `call_analysis.in_voicemail`
-was `true`, confirming the "closed · voicemail" label now surfaces correctly where it
-previously would have just read "closed" with no indication anything was off.
+`CallLog.outcome_reason` (nullable) sits alongside `status` — never used to *derive* it.
+At `call_ended` it's set to the raw `disconnection_reason`; at `call_analyzed`, if
+`call_analysis.in_voicemail` is `true` and the row isn't already voicemail-confirmed,
+it's upgraded to `"voicemail (detected late)"` — so a call that resolved `closed` via
+`agent_hangup` but was later confirmed as voicemail is visibly distinguishable, instead
+of that distinction staying buried in `call_analyzed`'s informational-only payload.
+`connection_failed` rows get `outcome_reason` from `ProviderCallError.category`
+(`invalid_request`/`provider_config_error`/`unknown`). The frontend maps these to short
+labels ("closed · voicemail", "no response · no answer", etc.) instead of raw enum
+strings. Verified live against `call_id=841098b8-...` and — after a real
+`call_ended`/`call_analyzed` ordering bug was found and fixed (see `CLAUDE.md`) — against
+`call_id=call_7300eee9...` as well.
 
 **Note on voicemail-label precedence:** `outcome_reason` preserves whichever
 voicemail confirmation arrives first (real-time `voicemail_reached` or
@@ -355,73 +661,26 @@ a live walkthrough.
 
 ### Future test coverage, by extension point
 
-The current suite (43 tests) covers the system as built today. Each likely extension
-below would need its own dedicated coverage before shipping:
-- **Second provider (e.g. Vapi):** a parallel `test_vapi_provider.py` mirroring
-  `test_retell_provider.py`'s shape (webhook-mapping table + `respx`-mocked
-  `place_call` categorization), plus a factory test confirming `PROVIDER=vapi` actually
-  selects it.
-- **SMS fallback:** tests that a `no_response`/`connection_failed` terminal state
-  triggers exactly one SMS send attempt, and that a send failure doesn't corrupt
-  `CallLog` (mirroring the existing "provider failure leaves the row persisted" test
-  pattern).
-- **Escalation to a human navigator:** tests around whatever new terminal/queued state
-  gets added, plus that escalation is idempotent (doesn't double-escalate on a
-  duplicate webhook, same DB-level dedup pattern as today).
-- **Batch calling:** concurrency tests — many simultaneous `POST /patients/{id}/call`
-  calls against the same patient, confirming the DB-write-before-provider-call
-  sequencing holds under load and no call gets silently dropped.
-- **EHR sync:** contract tests against whatever sync boundary is introduced (e.g. a
-  scheduled pull job), plus tests that PHI fields dropped today
-  (`insurance_number`, `medical_record_number`) still aren't persisted if/when they
-  start flowing through that sync.
-- **Retry/backoff:** tests that a transient provider failure is retried up to N times
-  with backoff before finally being marked `connection_failed`, and that retries don't
-  create duplicate `CallLog` rows.
-- **WebSockets:** tests that a status change is pushed to a connected client, and that a
-  disconnected/reconnecting client falls back to (or reconciles against) a normal
-  `GET /calls/{id}` poll.
-- **Auth:** tests that unauthenticated requests to every route are rejected, and
-  (separately) that `POST /events` rejects payloads with an invalid/missing
-  `X-Retell-Signature` once signature verification is implemented.
-
----
-
-## Likely Extensions
-
-- **Second provider (e.g. Vapi):** implement `CallProvider` in a new
-  `app/providers/vapi.py` (place_call/parse_webhook_event/get_call_status,
-  Vapi-specific error categorization) and register it in `factory.py` — no changes
-  needed to route handlers, `reconcile.py`, or `state_machine.py`, since that boundary
-  was built for exactly this.
-- **SMS fallback:** on a `no_response`/`connection_failed` terminal state, trigger an
-  SMS send (a new small provider-style abstraction, e.g. `SmsProvider`) — reuses the
-  same "write intent to DB before calling an external API" sequencing decision already
-  used for phone calls.
-- **Escalation to a human navigator:** a new terminal/queued state plus a notification
-  hook (e.g. Slack/email) fired when a call lands in `no_response` or
-  `connection_failed`, so a human can follow up — mostly a `state_machine.py` and
-  routing addition, not a new subsystem.
-- **Batch calling:** a scheduler that iterates patients with upcoming appointments and
-  calls `POST /patients/{id}/call` for each — the existing sequencing/idempotency
-  guarantees already support this; the new work is purely the scheduling/orchestration
-  layer.
-- **EHR sync:** a periodic or event-driven job to pull `Patient` fields (and
-  reintroduce fields deliberately dropped today, like `insurance_number`) from a real
-  EHR system instead of this repo owning that data — the `Patient` table's schema
-  would become a projection/cache rather than the source of truth.
-- **Retry/backoff:** wrap `place_call()` failures in a retry policy (e.g. exponential
-  backoff, capped attempts) before falling back to `connection_failed` — contained
-  entirely within the provider-call boundary in `calls.py`, doesn't touch the state
-  machine.
-- **WebSockets/real-time push:** replace or supplement the frontend's ~2.5s polling
-  loop with a push channel from backend to browser on every `CallLog` status change —
-  additive to the existing polling fallback rather than a replacement, for resilience.
-- **Auth:** add an API-gateway/auth layer in front of all four routes, plus wire up
-  Retell's `Retell.verify()` against `X-Retell-Signature` on `POST /events` so the
-  webhook receiver stops trusting arbitrary payloads — the single highest-priority item
-  in this list given the system currently handles real (if fictional/test) phone
-  numbers.
+The current suite (44 tests) covers the system as built today. Each extension in
+"Possible Future Architecture" above would need its own dedicated coverage:
+- **Second provider:** a parallel `test_vapi_provider.py` mirroring
+  `test_retell_provider.py`'s shape, plus a factory test confirming `PROVIDER=vapi`
+  actually selects it.
+- **SMS fallback:** a `no_response`/`connection_failed` state triggers exactly one SMS
+  attempt, and a send failure doesn't corrupt `CallLog` (same pattern as the existing
+  "provider failure leaves the row persisted" test).
+- **Escalation:** idempotency around whatever new terminal/queued state gets added
+  (doesn't double-escalate on a duplicate webhook).
+- **Batch calling:** concurrency tests confirming DB-write-before-provider-call holds
+  under many simultaneous `POST /patients/{id}/call` calls.
+- **EHR sync:** contract tests against the sync boundary, plus confirming PHI fields
+  dropped today still aren't persisted if/when they start flowing through.
+- **Retry/backoff:** a transient failure retries up to N times before `connection_failed`,
+  without creating duplicate `CallLog` rows.
+- **WebSockets:** a status change is pushed to a connected client, and a disconnected
+  client falls back to/reconciles against a normal poll.
+- **Auth:** unauthenticated requests to every route are rejected, and `POST /events`
+  rejects an invalid/missing `X-Retell-Signature` once implemented.
 
 ---
 
