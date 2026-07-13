@@ -21,6 +21,7 @@ export default function PatientTable({ patients }: { patients: Patient[] }) {
             <th className="py-3 px-4 font-medium text-slate-500">
               Timezone
             </th>
+            <th className="py-3 px-4 font-medium text-slate-500">Phone</th>
             <th className="py-3 px-4 font-medium text-slate-500">Call</th>
           </tr>
         </thead>

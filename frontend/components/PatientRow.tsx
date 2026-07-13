@@ -94,6 +94,7 @@ export default function PatientRow({ patient }: { patient: Patient }) {
         {patient.appointment_date} {patient.appointment_time}
       </td>
       <td className="py-3 px-4">{patient.timezone}</td>
+      <td className="py-3 px-4">{patient.phone_number}</td>
       <td className="py-3 px-4">
         <button
           onClick={placeCall}

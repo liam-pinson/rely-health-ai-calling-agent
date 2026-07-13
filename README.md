@@ -87,7 +87,27 @@ duplicated.
 virtualenv and run `cd backend && python -m app.seed_patients` from the repo root
 instead.)
 
-### 4. Expose the backend for Retell webhooks (cloudflared)
+### 4. Add a custom patient with a real phone number (optional)
+
+`seed_patients.py`'s synthetic `+1555...` numbers can't receive an actual call --
+if you want to place a real test call, add one patient with your own real, callable
+number instead:
+
+```bash
+docker compose exec backend python -m app.add_custom_patient \
+  --name "Full Name" \
+  --phone "+1..." \
+  --dob YYYY-MM-DD \
+  --appointment "YYYY-MM-DD HH:MM:SS" \
+  --timezone "America/Los_Angeles"
+```
+
+(`America/Los_Angeles` above is just the example used during this project's own
+testing, done from San Francisco -- use whatever timezone is correct for your
+patient.) Same idempotency behavior as the seed script: re-running with a phone
+number that already exists skips it with a warning instead of duplicating.
+
+### 5. Expose the backend for Retell webhooks (cloudflared)
 
 Retell delivers call-status webhooks (`call_started`, `call_ended`, `call_analyzed`) to
 a URL you configure in the Retell dashboard. Since this is local dev, that URL needs to
@@ -122,7 +142,7 @@ Both scripts require `cloudflared` to already be installed and on `PATH` (see
 Prerequisites above); if it isn't found, they'll tell you so instead of failing
 silently.
 
-### 5. Open the app
+### 6. Open the app
 
 Once the stack and tunnel are both up, open:
 
@@ -134,7 +154,7 @@ You'll see the patient list. Click "Call" on any row to place a real outbound ca
 Retell and watch its status update live (polled every ~2.5s) through to a terminal
 state.
 
-### 6. Run the backend test suite
+### 7. Run the backend test suite
 
 ```bash
 cd backend

@@ -262,6 +262,15 @@ services:
   whose `phone_number` already exists and warns instead of duplicating. Dev fixture
   only, not production tooling — never wired into app startup, and deliberately kept
   separate from any real patient data inserted for live end-to-end testing.
+- **`app/add_custom_patient.py`** — standalone CLI script, `python -m
+  app.add_custom_patient --name "Full Name" --phone "+1..." --dob YYYY-MM-DD
+  --appointment "YYYY-MM-DD HH:MM:SS" --timezone "America/Los_Angeles"`. Adds one
+  `Patient` row with a real, callable phone number — `seed_patients.py`'s synthetic
+  `+1555…` numbers can't receive an actual call, so this is the sanctioned path to a
+  real one. All fields via CLI args, no interactive prompts, no frontend UI. Same
+  idempotency pattern as `seed_patients.py` (skips with a warning instead of
+  duplicating if the phone number already exists). Same framing as `seed_patients.py`:
+  dev/testing convenience only, not production tooling.
 - **`app/reconcile.py`** — see "Reconciliation job" under Sequencing decisions above.
 - **`backend/tests/`** — pytest suite, run via `cd backend && python -m pytest`. 44
   tests, run against a real (dedicated, isolated) test Postgres database rather than a
