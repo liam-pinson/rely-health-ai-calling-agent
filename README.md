@@ -33,7 +33,7 @@ requirements that don't exist yet.
 
 ```bash
 git clone <this-repo-url>
-cd AI_Calling_Agent
+cd rely-health-ai-calling-agent
 cp backend/.env.example backend/.env
 ```
 
