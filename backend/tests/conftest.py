@@ -56,7 +56,11 @@ def clean_db():
     a rollback/savepoint pattern.
     """
     with app_engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE webhook_events, call_logs, patients CASCADE"))
+        conn.execute(
+            text(
+                "TRUNCATE TABLE webhook_events, transcript_turns, call_logs, patients CASCADE"
+            )
+        )
     yield
 
 

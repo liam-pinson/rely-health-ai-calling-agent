@@ -290,6 +290,21 @@ services:
    set from real observed latency data.
 4. **WebSockets/real-time push** — polling instead (frontend polls `GET /calls/{id}`
    every ~2.5s), not justified at this scale. Confirmed fine in practice.
+
+   **Update — live transcript feed implemented, additive not a replacement:** the
+   operator dashboard now shows `TranscriptTurn` rows live while a call is in progress,
+   pushed over a new WebSocket, `GET /calls/{call_id}/transcript-feed`
+   (`app/transcript_feed.py`). This is a second, independent channel carrying only
+   transcript turns — the original non-goal still holds for `CallLog.status`: the
+   ~2.5s `GET /calls/{id}` polling loop in `PatientRow.tsx` is completely untouched and
+   stays authoritative for status. The browser connects to this endpoint directly
+   (bypassing the Next.js proxy layer — Route Handlers can't proxy a WebSocket upgrade),
+   which doesn't need backend CORS support since WebSocket connections aren't subject to
+   the fetch/CORS restriction the proxy layer exists to sidestep. Implemented as DB
+   polling under the hood (1s interval), not Postgres `LISTEN/NOTIFY` or a message bus —
+   a real change-notification mechanism would be overbuilding for this scope, since
+   `TranscriptTurn` writes (in `llm_websocket.py`) and this read path have no in-process
+   connection to each other.
 5. **Security/auth** — no API gateway, no auth layer, no webhook signature verification.
    Retell ships a `Retell.verify()` helper against `X-Retell-Signature` for this later.
    The frontend's Next.js proxy layer doesn't change this — it's a CORS workaround, not
@@ -314,6 +329,110 @@ services:
 - Cost note: LLM/voice engine model selection matters a lot for credit burn — check
   agent's configured model before running more test calls (a cheap Gemini Flash-tier
   model vs. a premium model was ~10x+ cost difference in one test call).
+
+---
+
+## Guardrail flagging (Phase 2 — in progress)
+
+**Status: the `TranscriptFlag` pipeline is implemented (models, category taxonomy,
+regex + LLM dispatch). Escalation — deriving a per-call current-belief row from flags,
+ratcheting severity, notifying a navigator, dashboard surfacing — is a separate, later
+piece of this same feature and is NOT built yet.** `TranscriptFlag` rows exist today
+with no consumer beyond direct inspection.
+
+### Category taxonomy (`app/guardrails.py`)
+
+Two disjoint category sets, one per role:
+- `PATIENT_CATEGORIES` — signals the patient needs a human: `self_harm`, `acute_medical`
+  (high); `physical_symptom`, `financial_barrier`, `transportation_barrier`,
+  `caregiver_barrier`, `confusion`, `dissatisfaction` (low).
+- `AGENT_CATEGORIES` — signals our own LLM did something wrong: `medical_advice` (high);
+  `fabrication`, `off_script` (low).
+
+`CATEGORY_SEVERITY` is the single, only place severity is decided — not the LLM
+classifier, not the regex rules, not the escalation logic (not yet built). This is
+deliberate: the LLM's job is to identify WHAT was said (a category); CODE decides HOW
+URGENT that is, so severity stays reviewable/changeable in one place without touching a
+prompt or retraining a classifier.
+
+### Two-tier detection, and why
+
+**Regex tier** (`PATIENT_RULES`/`AGENT_RULES`) — fast, deterministic, high-precision/
+low-recall by design. Only categories that are consistent, specific phrasings get a
+regex rule at all. Two categories deliberately have NO regex rule: `fabrication`
+(requires comparing a claim against the real Patient record — a regex has no ground
+truth to check against) and `off_script` (requires judging conversational scope — a
+regex has no notion of "on-topic"). Four PATIENT categories
+(`physical_symptom`/`financial_barrier`/`transportation_barrier`/`caregiver_barrier`)
+are regex-free for the same reason: too many real-world phrasings to pattern-match
+without either missing most of them or firing on noise. All of these are LLM-tier-only
+by design, not by omission — the regex tier owns precision, the LLM tier owns recall.
+
+**LLM tier** (`openai_client.classify_utterance`) — the model identifies categories and
+must cite a **verbatim** span (`cited_phrase`) copied character-for-character from the
+utterance that triggered each one, never a paraphrase or summary. This is what makes an
+LLM flag auditable against the real transcript rather than an unfalsifiable model
+judgment. The model must NOT return a severity (ignored if it does); any category not
+valid for that role is discarded and logged (a hallucinated category must never reach
+the DB); a malformed/non-JSON response resolves to `[]` and logs rather than raising (a
+classifier failure must never crash the socket handler or drop the call it's watching).
+
+The two classifier prompts (patient/navigator, in `openai_client.py`) are **spec
+artifacts under review, not free-form implementation** — copied verbatim. Any future
+wording change should go back through review, not be silently reworded in code.
+
+### `fabrication` and `appointment_facts`
+
+`classify_utterance(content, role, appointment_facts=None)` — `appointment_facts`
+(patient name, appointment date/time/timezone) is the ground truth the `fabrication`
+category is checked against, and is **ignored entirely for `role == "patient"`** (the
+patient prompt has no such placeholders at all). For `role == "navigator"`, if
+`appointment_facts` is `None`, `fabrication` is omitted from BOTH the category list
+offered to the model AND the set of categories this function will accept back (a
+warning is logged) — a category the model can name but cannot verify against anything
+produces confident noise, which is worse than no rule at all. Same reasoning that
+already kept `fabrication` out of `AGENT_RULES`'s regex tier.
+
+`appointment_facts` is built in `app/llm_websocket.py` from the SAME `Patient` row
+already loaded for that `response_required` cycle's response-generation prompt — never
+a second, separate query.
+
+### Trigger + dispatch (`app/llm_websocket.py`)
+
+Flagging runs **only** on `interaction_type == "response_required"` — never
+`update_only` (turn content is still provisional, growing across deliveries via
+`ON CONFLICT DO UPDATE` as ASR finalizes — see `transcript_store.py`) and never
+`reminder_required` (a silence timeout carries no new speech, so re-scanning would be
+pure waste). The two interaction types are semantically different triggers and are not
+collapsed into one flagging handler, even though both still drive the spoken response
+unchanged.
+
+**Ordering is a hard requirement, not an implementation detail:**
+1. Regex rules run synchronously against every `TranscriptTurn` with
+   `flag_evaluated_at IS NULL`.
+2. The resulting `TranscriptFlag` rows are written and COMMITTED.
+3. Only then is `classify_utterance` dispatched, via `asyncio.create_task` — never
+   awaited by the main loop, so a slow classification never stalls the agent's next
+   spoken turn.
+
+This bounds time-to-flag for an unambiguous regex match (e.g. a clear `self_harm`
+phrase) by regex speed, not by OpenAI latency — the same recoverable-over-unrecoverable
+sequencing already used for `CallLog` (write before calling the provider). An OpenAI
+outage or slowdown must degrade recall (the LLM tier's findings arrive late or not at
+all); it must never suppress a regex signal that's already known. Both tiers **always**
+run on every unevaluated turn regardless of what the other found — they catch different
+categories, not the same category at different confidence, so a regex hit never
+short-circuits the LLM call.
+
+`flag_evaluated_at` is set **after** the LLM task completes, not at dispatch — a crash
+before completion causes a duplicate dispatch later, which `TranscriptFlag`'s UNIQUE
+constraint on `(call_id, turn_index, source, matched_phrase)` rejects harmlessly.
+Marking evaluated at dispatch time would risk losing a safety flag permanently on the
+same crash. Duplicate spend is recoverable; a silently dropped flag is not.
+
+`role == "unknown"` turns are skipped (logged) from both tiers and marked evaluated
+immediately — an unclassifiable turn surfaces via the log line rather than being
+silently guessed into either ruleset.
 
 ---
 

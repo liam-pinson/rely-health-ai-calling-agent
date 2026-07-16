@@ -83,6 +83,14 @@ class RetellProvider(CallProvider):
         )
 
     def parse_webhook_event(self, raw_payload: Dict[str, Any]) -> NormalizedWebhookEvent:
+        # NOTE: transcript_updated is not handled here -- it's dead under a
+        # custom-llm response_engine (this agent's current configuration).
+        # Retell delivers live transcript turns directly over the
+        # llm-websocket connection instead (interaction_type: "update_only"
+        # / "response_required") -- see app/llm_websocket.py and
+        # app/transcript_store.py. If this provider is ever used with a
+        # retell-llm (dashboard-hosted) agent again, transcript_updated
+        # would need to be re-added here.
         event_type = raw_payload.get("event")
         call = raw_payload.get("call") or {}
         provider_call_id = call.get("call_id")

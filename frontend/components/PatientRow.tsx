@@ -5,6 +5,7 @@ import type { CallLog, Patient } from "@/lib/types";
 import { isTerminalStatus } from "@/lib/types";
 import { networkAwareMessage } from "@/lib/errors";
 import { statusLabel, terminalStatusLabel } from "@/lib/outcomeLabels";
+import TranscriptFeed from "@/components/TranscriptFeed";
 
 const POLL_INTERVAL_MS = 2500;
 
@@ -85,35 +86,44 @@ export default function PatientRow({ patient }: { patient: Patient }) {
   const buttonLabel = placing ? "Calling…" : callLog ? "Call again" : "Call";
 
   return (
-    <tr className="border-b border-slate-100 align-top last:border-0">
-      <td className="py-3 px-4">
-        {patient.first_name} {patient.last_name}
-      </td>
-      <td className="py-3 px-4">{patient.date_of_birth}</td>
-      <td className="py-3 px-4">
-        {patient.appointment_date} {patient.appointment_time}
-      </td>
-      <td className="py-3 px-4">{patient.timezone}</td>
-      <td className="py-3 px-4">{patient.phone_number}</td>
-      <td className="py-3 px-4">
-        <button
-          onClick={placeCall}
-          disabled={placing || inProgress}
-          className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50"
-        >
-          {buttonLabel}
-        </button>
-        {callLog && (
-          <p className="mt-1.5 text-sm text-slate-600">
-            status:{" "}
-            {isTerminalStatus(callLog.status)
-              ? terminalStatusLabel(callLog.status, callLog.outcome_reason)
-              : statusLabel(callLog.status)}
-            {inProgress && " (polling…)"}
-          </p>
-        )}
-        {error && <p className="mt-1.5 text-sm text-red-600">{error}</p>}
-      </td>
-    </tr>
+    <>
+      <tr className="border-b border-slate-100 align-top">
+        <td className="py-3 px-4">
+          {patient.first_name} {patient.last_name}
+        </td>
+        <td className="py-3 px-4">{patient.date_of_birth}</td>
+        <td className="py-3 px-4">
+          {patient.appointment_date} {patient.appointment_time}
+        </td>
+        <td className="py-3 px-4">{patient.timezone}</td>
+        <td className="py-3 px-4">{patient.phone_number}</td>
+        <td className="py-3 px-4">
+          <button
+            onClick={placeCall}
+            disabled={placing || inProgress}
+            className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50"
+          >
+            {buttonLabel}
+          </button>
+          {callLog && (
+            <p className="mt-1.5 text-sm text-slate-600">
+              status:{" "}
+              {isTerminalStatus(callLog.status)
+                ? terminalStatusLabel(callLog.status, callLog.outcome_reason)
+                : statusLabel(callLog.status)}
+              {inProgress && " (polling…)"}
+            </p>
+          )}
+          {error && <p className="mt-1.5 text-sm text-red-600">{error}</p>}
+        </td>
+      </tr>
+      {callLog && (
+        <tr className="border-b border-slate-100 last:border-0">
+          <td colSpan={6} className="px-4 pb-4">
+            <TranscriptFeed callId={callLog.call_id} />
+          </td>
+        </tr>
+      )}
+    </>
   );
 }

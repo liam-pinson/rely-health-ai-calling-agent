@@ -16,6 +16,43 @@ that webhook-driven flow with a reconciliation job for the cases webhooks can't 
 near-term growth (a second call provider, SMS fallback, etc.) without overbuilding for
 requirements that don't exist yet.
 
+## Extension: Custom-LLM Navigator, Live Feed & Guardrails
+
+Beyond the original take-home scope, the agent was rebuilt to run as a **custom LLM**
+instead of Retell's dashboard-hosted agent, and three new capabilities were layered on
+top of that:
+
+- **Custom-LLM conversational agent** (`app/llm_websocket.py`, `app/openai_client.py`) —
+  Retell's `response_engine` now points at a WebSocket we own instead of a
+  dashboard-configured `retell-llm` agent. This is a *separate* integration surface from
+  the original REST webhook path (`POST /events`) — `CallLog`/`state_machine.py` are
+  completely untouched by it and still derive call status the same way they always did.
+  The navigator runs a full, non-scripted conversation (greeting → appointment
+  confirm/reschedule → open listening → closing) grounded in the real `Patient` record so
+  it never hallucinates appointment details, with conversation history rebuilt from the
+  DB on every turn (survives a process restart mid-call) and a fixed non-LLM opening
+  greeting so a slow/dead OpenAI call can never leave the patient in silence.
+- **Live transcript feed on the dashboard** (`app/transcript_feed.py`,
+  `frontend/components/TranscriptFeed.tsx`) — a second, independent WebSocket the
+  *browser* connects to directly (bypassing the Next.js proxy, which can't relay a raw
+  WebSocket upgrade) to watch the conversation fill in turn-by-turn while a call is in
+  progress. Additive to the existing `GET /calls/{id}` status polling, not a
+  replacement — see "Current Architecture" and "Design Notes" below for the full
+  rationale.
+- **Guardrail flagging + escalation** (`app/guardrails.py`, `app/escalation_view.py`) —
+  every settled turn is checked against a two-tier detection system: fast/deterministic
+  regex for specific, high-precision phrasings, plus an LLM classifier
+  (`openai_client.classify_utterance`) that owns recall for everything regex can't
+  reliably catch (financial/transportation/caregiver barriers on the patient side;
+  fabricated details or off-script behavior on the agent side). Findings ratchet a
+  per-call `Escalation` row (severity only ever goes up, never down) and surface live as
+  a banner on the same transcript-feed socket — see "Guardrail flagging" under Design
+  Notes for the full category taxonomy and the reasoning behind the tier split.
+
+Everything above is described in full technical detail inline in the relevant sections
+of this README and in `CLAUDE.md`; this section is just the narrative summary of what
+changed and why.
+
 ## Setup
 
 ### Prerequisites
@@ -214,6 +251,7 @@ flowchart TB
         CallEP["POST /patients/{id}/call"]
         Events["POST /events (webhook receiver)"]
         CallsGet["GET /calls/{id}"]
+        TranscriptFeed["GET /calls/{id}/transcript-feed<br/>(WebSocket, browser-direct)"]
         SM["state_machine.py<br/>(ALLOWED_TRANSITIONS)"]
         Reconcile["reconcile.py<br/>(sweep + BFS replay)"]
         Provider["CallProvider interface"]
@@ -224,6 +262,7 @@ flowchart TB
         PatientTbl[("patients")]
         CallLogTbl[("call_logs<br/>status, outcome_reason")]
         WebhookTbl[("webhook_events")]
+        TranscriptTbl[("transcript_turns")]
     end
 
     subgraph External["Retell (external)"]
@@ -232,6 +271,7 @@ flowchart TB
     end
 
     UI --> Proxy --> Patients & CallEP & CallsGet
+    UI -.direct WebSocket, no proxy.-> TranscriptFeed
     CallEP --> SM --> CallLogTbl
     CallEP --> Provider --> Retell --> RetellAPI
     RetellAPI -.webhook.-> Tunnel --> Events --> WebhookTbl
@@ -240,11 +280,13 @@ flowchart TB
     Reconcile --> SM
     Patients --> PatientTbl
     CallsGet --> CallLogTbl
+    TranscriptFeed --> TranscriptTbl
+    TranscriptFeed --> CallLogTbl
 
     class UI,Proxy frontend
-    class Patients,CallEP,Events,CallsGet route
+    class Patients,CallEP,Events,CallsGet,TranscriptFeed route
     class SM,Reconcile,Provider,Retell logic
-    class PatientTbl,CallLogTbl,WebhookTbl db
+    class PatientTbl,CallLogTbl,WebhookTbl,TranscriptTbl db
     class RetellAPI,Tunnel external
 
     classDef frontend fill:#4A90D9,stroke:#2C5F8A,color:#fff
@@ -253,6 +295,11 @@ flowchart TB
     classDef db fill:#9E9E9E,stroke:#616161,color:#fff
     classDef external fill:#E8994C,stroke:#B5702A,color:#fff
 ```
+
+`transcript_turns` is written by the custom-LLM WebSocket handler
+(`app/llm_websocket.py`, Retell-facing -- not pictured above, see "Design Notes" for the
+full custom-LLM pivot writeup) and read live by `transcript-feed` -- two completely
+independent WebSocket surfaces to two different counterparties.
 
 | Color | Meaning |
 |---|---|
@@ -564,7 +611,6 @@ flowchart TB
     Batch["Batch / bulk<br/>calling orchestrator"]
     EHR["EHR sync service"]
     Scheduler["Cron / APScheduler<br/>(auto-run reconcile.py)"]
-    WS["WebSocket push<br/>(replace polling)"]
     Auth["Auth layer<br/>(session/token, RBAC)"]
 
     Provider -.-> Vapi
@@ -573,7 +619,6 @@ flowchart TB
     CallEP -.-> Batch
     PatientTbl -.-> EHR
     Reconcile -.-> Scheduler
-    CallsGet -.-> WS
     Client -.-> Auth
     Backend -.-> Auth
 
@@ -582,7 +627,7 @@ flowchart TB
     class SM,Reconcile,Provider,Retell logic
     class PatientTbl,CallLogTbl,WebhookTbl db
     class RetellAPI,Tunnel external
-    class Vapi,SMS,Escalation,Batch,EHR,Scheduler,WS,Auth future
+    class Vapi,SMS,Escalation,Batch,EHR,Scheduler,Auth future
 
     classDef frontend fill:#4A90D9,stroke:#2C5F8A,color:#fff
     classDef route fill:#5CB85C,stroke:#3D8B3D,color:#fff
@@ -620,9 +665,6 @@ flowchart TB
 - **Retry/backoff:** wrap `place_call()` failures in a retry policy before falling back
   to `connection_failed` — contained entirely within `calls.py`'s provider-call boundary,
   doesn't touch the state machine.
-- **WebSockets/real-time push:** replace or supplement the ~2.5s polling loop with a
-  push channel — additive to the existing polling fallback for resilience, not a
-  replacement.
 - **Auth:** add an API-gateway/auth layer in front of all four routes, plus wire up
   Retell's `Retell.verify()` on `POST /events` so the webhook receiver stops trusting
   arbitrary payloads — the single highest-priority item here given the system handles
@@ -705,6 +747,61 @@ not tracked in `CallLog`/webhook data, and is outside this project's scope.
 Flagged here so it isn't mistaken for a feature of this application during
 a live walkthrough.
 
+### Guardrail flagging: two-tier detection (Phase 2, in progress)
+
+**Status: the flag-writing pipeline is built (models, category taxonomy, regex + LLM
+dispatch). Escalation — a derived, ratcheting per-call state and navigator
+notification — is a separate, later piece and is not built yet.** Full design writeup
+lives in `CLAUDE.md`; this is the README-level summary.
+
+Every settled `TranscriptTurn` is checked against two independent tiers, both always
+run, never one short-circuiting the other:
+
+- **Regex** (`app/guardrails.py`) — fast and deterministic, but deliberately
+  high-precision/low-recall: only specific, consistent phrasings get a rule at all.
+  Several categories (patient-side `financial_barrier`/`transportation_barrier`/
+  `caregiver_barrier`/`physical_symptom`; agent-side `fabrication`/`off_script`) have no
+  regex rule on purpose — `fabrication` needs to be checked against the real
+  appointment record and `off_script` needs conversational judgment, neither of which a
+  pattern match can do. Forcing a regex there would fire on noise, which is worse than
+  no rule.
+- **LLM** (`openai_client.classify_utterance`) — owns recall for everything regex can't
+  reliably catch. Every finding must cite a **verbatim** span of the actual utterance
+  (`cited_phrase`) rather than a paraphrase, so a flag is auditable against the real
+  transcript instead of being an unfalsifiable model opinion. The model identifies
+  categories only; it never assigns severity — that mapping (`CATEGORY_SEVERITY` in
+  `guardrails.py`) is decided entirely in code, in one reviewable place, so it can
+  change without touching a prompt. The two classifier prompts (patient/navigator) are
+  treated as reviewed spec artifacts, copied verbatim into `openai_client.py`, not
+  paraphrased or improvised in code.
+
+**Ordering guarantee:** for each unevaluated turn, regex rules run and their
+`TranscriptFlag` rows are committed *before* the LLM classification is even dispatched
+(as an uncounted `asyncio.create_task`, never awaited by the socket handler). This means
+an unambiguous regex match — a clear self-harm phrase, say — lands in the database in
+milliseconds regardless of OpenAI's health. An OpenAI outage or slowdown degrades
+recall (the LLM tier's findings arrive late or not at all); it never suppresses a
+regex signal that's already known. Same recoverable-over-unrecoverable reasoning as
+writing `CallLog` before calling the provider's API.
+
+**`fabrication` and ground truth:** the agent-side `fabrication` category can only be
+checked against something — the real `Patient` record. `classify_utterance` takes an
+`appointment_facts` argument (name/date/time/timezone) built from the *same* `Patient`
+row already loaded for that turn's response-generation prompt, never a second query.
+If it's unavailable for any reason, `fabrication` is dropped from both the prompt and
+the set of categories that call will accept back — offering the model a category it
+has no way to verify would just produce confident noise.
+
+**Known limitation — single-utterance, context-free classification.** The classifier
+sees one turn in isolation, never the surrounding conversation. An utterance whose
+meaning depends on what was said just before it (e.g. "yeah, that's going to be a
+problem" replying to an unheard question) is uninterpretable on its own and correctly
+returns no findings. Passing the last N turns as context would improve recall, but
+costs tokens on every single classification of every single turn, and the categories
+this feature exists to catch are overwhelmingly stated directly ("I can't afford the
+copay," "I've been having chest pain") rather than implied. This is a deliberate
+non-goal for this scope, not an oversight.
+
 ### Future test coverage, by extension point
 
 The current suite (44 tests) covers the system as built today. Each extension in
@@ -742,8 +839,11 @@ inline in the code:
 - **No auth or API gateway anywhere**, including no webhook signature verification on
   `POST /events` (Retell's `Retell.verify()` helper is not wired up). The Next.js proxy
   layer is a CORS workaround, not a security boundary.
-- **No WebSockets/real-time push** — the frontend polls `GET /calls/{id}` every ~2.5s
-  instead.
+- **Live transcript feed is additive, not authoritative** — the new
+  `GET /calls/{id}/transcript-feed` WebSocket has no reconnect logic and the browser
+  connects to it directly, bypassing the Next.js proxy (see "Current Architecture").
+  `CallLog.status` polling (`GET /calls/{id}`, ~2.5s) is untouched and remains the
+  authoritative channel regardless of whether the transcript feed connects.
 - **No scalable/async webhook processing** — `POST /events` is handled synchronously,
   no queue. Fine at this scale; would need revisiting specifically if the synchronous
   write path risks Retell's 10-second webhook delivery timeout.

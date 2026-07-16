@@ -46,6 +46,11 @@ async def receive_webhook(
     # Retell's Retell.verify() against X-Retell-Signature) before trusting
     # the payload. Signature verification is an explicit non-goal for this
     # scope (see CLAUDE.md "Non-goals" -- no auth layer yet).
+    #
+    # NOTE: transcript_updated is not handled here -- it's dead under this
+    # agent's custom-llm response_engine. Live transcript turns arrive over
+    # the llm-websocket connection instead; see app/llm_websocket.py and
+    # app/transcript_store.py.
     normalized = provider.parse_webhook_event(payload)
 
     # Raw event log happens first and unconditionally, before any

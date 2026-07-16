@@ -38,3 +38,18 @@ export const TERMINAL_CALL_STATUSES: readonly CallStatus[] = [
 export function isTerminalStatus(status: CallStatus): boolean {
   return TERMINAL_CALL_STATUSES.includes(status);
 }
+
+export interface TranscriptTurn {
+  turn_index: number;
+  role: "navigator" | "patient" | "unknown";
+  content: string;
+  started_at: number | null;
+  ended_at: number | null;
+}
+
+export interface Escalation {
+  severity: "high" | "low";
+  status: "pending" | "notified";
+  matched_phrase: string | null;
+  flagged_role: string | null;
+}

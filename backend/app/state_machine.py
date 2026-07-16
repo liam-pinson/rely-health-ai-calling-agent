@@ -14,3 +14,11 @@ ALLOWED_TRANSITIONS = {
 
 def is_legal_transition(current_status: str, target_status: str) -> bool:
     return target_status in ALLOWED_TRANSITIONS.get(current_status, set())
+
+
+def is_terminal_status(status: str) -> bool:
+    """True for a status with no further legal transitions -- the single
+    source of truth for "terminal" so callers (e.g. transcript_feed.py)
+    never need their own hardcoded status list.
+    """
+    return not ALLOWED_TRANSITIONS.get(status)

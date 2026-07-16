@@ -68,6 +68,27 @@ def test_parse_webhook_event_call_started_maps_to_ongoing():
     assert result.outcome_reason is None
 
 
+def test_parse_webhook_event_transcript_updated_is_not_specially_handled():
+    # Regression guard: transcript_updated is dead under a custom-llm
+    # response_engine (live transcript arrives over app/llm_websocket.py
+    # instead -- see CLAUDE.md). Confirms it now falls through to the
+    # generic "unrecognized -> informational only" branch rather than
+    # erroring, proving the old dedicated branch was actually removed, not
+    # just shadowed.
+    provider = RetellProvider()
+    payload = {
+        "event": "transcript_updated",
+        "call": {"call_id": "pcid", "transcript_object": [{"role": "agent", "content": "hi"}]},
+        "event_timestamp": 1700000000000,
+    }
+
+    result = provider.parse_webhook_event(payload)
+
+    assert result.mapped_status is None
+    assert result.event_type == "transcript_updated"
+    assert result.provider_call_id == "pcid"
+
+
 def test_parse_webhook_event_call_analyzed_is_informational_only():
     provider = RetellProvider()
     payload = {

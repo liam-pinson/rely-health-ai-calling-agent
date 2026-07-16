@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.escalation_view import get_escalation_display
 from app.models import CallLog, Patient
 from app.providers.base import CallProvider, ProviderCallError
 from app.providers.factory import get_provider
@@ -82,3 +83,24 @@ async def get_call(call_id: uuid.UUID, db: Session = Depends(get_db)):
     if call_log is None:
         raise HTTPException(status_code=404, detail="Call not found")
     return call_log
+
+
+class EscalationResponse(BaseModel):
+    call_id: uuid.UUID
+    severity: str
+    status: str
+    matched_phrase: Optional[str]
+    flagged_role: Optional[str]
+
+
+@router.get(
+    "/calls/{call_id}/escalation",
+    response_model=EscalationResponse,
+)
+async def get_escalation(call_id: uuid.UUID, db: Session = Depends(get_db)):
+    # So the dashboard banner survives a page reload / reconnect mid-call --
+    # a safety indicator that disappears on refresh is worse than none.
+    display = get_escalation_display(db, call_id)
+    if display is None:
+        raise HTTPException(status_code=404, detail="No escalation for this call")
+    return display

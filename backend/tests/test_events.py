@@ -8,6 +8,7 @@ import uuid
 import pytest
 
 
+
 def _call_started_payload(provider_call_id: str) -> dict:
     return {
         "event": "call_started",
